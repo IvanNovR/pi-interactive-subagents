@@ -1,7 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { SelectList, matchesKey, type SelectItem } from "@mariozechner/pi-tui";
+import type { Component, TUI, KeybindingsManager } from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,7 +12,7 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
-  copyFileSync,
+  renameSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -169,6 +171,140 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+type ModelConfigScope = "session" | "project" | "global";
+type ModelConfigContext = {
+  cwd?: string;
+  model?: { provider: string; id: string };
+  sessionManager?: {
+    getSessionFile(): string | null | undefined;
+    getSessionDir(): string;
+    getSessionId(): string;
+  };
+};
+
+/** Resolve persistent session metadata without creating files or mutating ctx. */
+function getSessionArtifactDir(ctx: ModelConfigContext): string | undefined {
+  const manager = ctx.sessionManager;
+  if (!manager?.getSessionFile()) return undefined;
+  const sessionDir = manager.getSessionDir();
+  const sessionId = manager.getSessionId();
+  return sessionDir && sessionId ? getArtifactDir(sessionDir, sessionId) : undefined;
+}
+
+function getModelConfigPath(scope: ModelConfigScope, ctx: ModelConfigContext): string | undefined {
+  if (scope === "session") {
+    const artifactDir = getSessionArtifactDir(ctx);
+    return artifactDir ? join(artifactDir, "subagent-models.json") : undefined;
+  }
+  if (scope === "project") {
+    if (!ctx.cwd) throw new Error("Cannot access project model config: parent working directory is unavailable");
+    return join(ctx.cwd, ".pi", "subagent-models.json");
+  }
+  return join(getAgentConfigDir(), "subagent-models.json");
+}
+
+function validateModelValue(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim() || value !== value.trim() || /\s/.test(value)) {
+    throw new Error(`${label} must be a non-empty model string without whitespace`);
+  }
+}
+
+function validateModelConfig(value: unknown, configPath: string): asserts value is Record<string, string> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Invalid model config ${configPath}: expected a JSON object`);
+  }
+  for (const [agent, model] of Object.entries(value)) {
+    validateModelValue(model, `Invalid model config ${configPath}, agent "${agent}"`);
+  }
+}
+
+/** Missing files are empty; unreadable or malformed files are never silently replaced. */
+function loadModelConfig(configPath: string): Record<string, string> {
+  let content: string;
+  try {
+    content = readFileSync(configPath, "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return {};
+    throw new Error(`Cannot read model config ${configPath}: ${error?.message ?? String(error)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error: any) {
+    throw new Error(`Cannot parse model config ${configPath}: ${error?.message ?? String(error)}`);
+  }
+  validateModelConfig(parsed, configPath);
+  return parsed;
+}
+
+/** Explicit > Session > Project > Global > frontmatter > live parent model.
+ * "inherit" continues the cascade; "session" stops at the live parent model.
+ * Undefined leaves model selection to Pi's CLI default.
+ */
+function resolveSubagentModel(
+  agentName: string,
+  ctx: ModelConfigContext,
+  agentModel?: string,
+  explicitModel?: string,
+  options: { fallbackToParent?: boolean } = {},
+): string | undefined {
+  const liveModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+  const resolveValue = (value: string | undefined): string | undefined => {
+    if (value !== undefined) validateModelValue(value, `Model for agent "${agentName}"`);
+    return value === "session" ? liveModel : value;
+  };
+  if (explicitModel !== undefined && explicitModel !== "inherit") return resolveValue(explicitModel);
+  for (const scope of ["session", "project", "global"] as const) {
+    const config = getModelConfig(scope, ctx);
+    const value = Object.hasOwn(config, agentName) ? config[agentName] : undefined;
+    if (value === undefined || value === "inherit") continue;
+    return resolveValue(value);
+  }
+  if (agentModel !== undefined && agentModel !== "inherit") return resolveValue(agentModel);
+  return options.fallbackToParent !== false ? liveModel : undefined;
+}
+
+/** Atomic replacement in the same directory; failures propagate to the caller/UI. */
+function saveModelConfig(configPath: string, config: Record<string, string>): void {
+  validateModelConfig(config, configPath);
+  // Refuse to overwrite an existing corrupt or unreadable file even for direct callers.
+  loadModelConfig(configPath);
+  const temporaryPath = `${configPath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(temporaryPath, JSON.stringify(config, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
+    renameSync(temporaryPath, configPath);
+  } catch (error: any) {
+    throw new Error(`Cannot save model config ${configPath}: ${error?.message ?? String(error)}`);
+  } finally {
+    try { unlinkSync(temporaryPath); } catch { /* Already renamed or never created. */ }
+  }
+}
+
+function getModelConfig(scope: ModelConfigScope, ctx: ModelConfigContext): Record<string, string> {
+  const configPath = getModelConfigPath(scope, ctx);
+  return configPath ? loadModelConfig(configPath) : {};
+}
+
+/** Set a model override, or remove it with null. No-session saves explicitly fail. */
+function setModelConfig(
+  scope: ModelConfigScope,
+  agentName: string,
+  model: string | null,
+  ctx: ModelConfigContext,
+): void {
+  const configPath = getModelConfigPath(scope, ctx);
+  if (!configPath) throw new Error("Cannot save session model config: no persistent session is active");
+  if (model !== null) validateModelValue(model, `Model for agent "${agentName}"`);
+  const config = loadModelConfig(configPath);
+  if (model === null) {
+    delete config[agentName];
+  } else {
+    Object.defineProperty(config, agentName, { value: model, enumerable: true, configurable: true, writable: true });
+  }
+  saveModelConfig(configPath, config);
+}
+
 // ── Runtime tool-extension registration ─────────────────────────────────────
 // `getToolExtensionPath` otherwise only knows a closed set of tool names. Other
 // pi extensions that bundle a tool for subagents (e.g. a project-local
@@ -304,12 +440,13 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   };
 }
 
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
+function discoverAgentDefinitions(cwd: string = process.cwd()): ListedAgentDefinition[] {
   const agents = new Map<string, ListedAgentDefinition>();
+  // Bundled profiles are a read-only fallback; never install into the user's global directory.
   const dirs: Array<{ path: string; source: AgentSource }> = [
     { path: getBundledAgentsDir(), source: "package" },
     { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
+    { path: join(cwd, ".pi", "agents"), source: "project" },
   ];
 
   for (const { path: dir, source } of dirs) {
@@ -333,10 +470,11 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
+  parentCwd: string = process.cwd(),
 ): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
-  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
+  const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : parentCwd;
   const effectiveCwd = rawCwd
     ? rawCwd.startsWith("/")
       ? rawCwd
@@ -401,10 +539,10 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
+function loadAgentDefaults(agentName: string, cwd: string = process.cwd()): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
+    join(cwd, ".pi", "agents", `${agentName}.md`),
     join(configDir, "agents", `${agentName}.md`),
     join(getBundledAgentsDir(), `${agentName}.md`),
   ];
@@ -1148,6 +1286,14 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  loadModelConfig,
+  getSessionArtifactDir,
+  getModelConfigPath,
+  validateModelValue,
+  resolveSubagentModel,
+  saveModelConfig,
+  getModelConfig,
+  setModelConfig,
 };
 
 function startWidgetRefresh() {
@@ -1167,14 +1313,16 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: ModelConfigContext & { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent, ctx.cwd) : null;
+  const effectiveModel = resolveSubagentModel(params.agent, ctx, agentDefs?.model, params.model, {
+    fallbackToParent: agentDefs?.cli !== "claude",
+  });
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1185,7 +1333,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs, ctx.cwd);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1643,7 +1791,7 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -1725,7 +1873,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // unknown `agent` silently launches an unrestricted, full-toolset child.
         const permittedAgents = SUBAGENT_ALLOWLIST
           ? [...SUBAGENT_ALLOWLIST]
-          : discoverAgentDefinitions().map((a) => a.name);
+          : discoverAgentDefinitions(ctx.cwd).map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
 
@@ -1963,8 +2111,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
 
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+        const list = discoverAgentDefinitions(ctx?.cwd).filter((agent) => !agent.disableModelInvocation);
 
         if (list.length === 0) {
           return {
@@ -2319,6 +2467,241 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── Interactive TUI for /subagent-settings command ──
+
+  /**
+   * SubagentSettingsUI - Interactive TUI component with tabs for managing subagent models.
+   */
+  class SubagentSettingsUI implements Component {
+    private currentTab: 0 | 1 | 2 = 0; // Session=0, Project=1, Global=2
+    private agents: ListedAgentDefinition[];
+    private selectList!: SelectList;
+    private tui: TUI;
+    private theme: Theme;
+    private kb: KeybindingsManager;
+    private done: (result: { agentName: string; tab: 0 | 1 | 2 } | null) => void;
+    private ctx: ExtensionContext;
+    private reportedErrors = new Set<string>();
+
+    constructor(
+      tui: TUI,
+      theme: Theme,
+      kb: KeybindingsManager,
+      done: (result: { agentName: string; tab: 0 | 1 | 2 } | null) => void,
+      ctx: ExtensionContext,
+      tab: 0 | 1 | 2 = 0,
+      selectedName?: string,
+    ) {
+      this.tui = tui;
+      this.theme = theme;
+      this.kb = kb;
+      this.done = done;
+      this.ctx = ctx;
+      this.currentTab = tab;
+      this.agents = discoverAgentDefinitions(ctx.cwd);
+      this.buildSelectList();
+      const index = this.agents.findIndex((agent) => agent.name === selectedName);
+      if (index >= 0) this.selectList.setSelectedIndex(index);
+    }
+
+    private buildSelectList(): void {
+      const selectedName = this.selectList?.getSelectedItem()?.value;
+      const items = this.agents.map((agent): SelectItem => ({
+        value: agent.name,
+        label: agent.name,
+        description: this.getModelDescription(agent.name),
+      }));
+
+      this.selectList = new SelectList(items, Math.min(items.length + 2, 12), {
+        selectedPrefix: (text) => this.theme.fg("accent", text),
+        selectedText: (text) => this.theme.fg("accent", text),
+        description: (text) => this.theme.fg("muted", text),
+        scrollInfo: (text) => this.theme.fg("muted", text),
+        noMatch: (text) => this.theme.fg("muted", text),
+      });
+
+      const selectedIndex = items.findIndex((item) => item.value === selectedName);
+      if (selectedIndex >= 0) this.selectList.setSelectedIndex(selectedIndex);
+      this.selectList.onSelect = (item) => {
+        if (!this.sessionEditingDisabled()) this.done({ agentName: item.value, tab: this.currentTab });
+      };
+
+      this.selectList.onCancel = () => {
+        this.done(null);
+      };
+    }
+
+    private getModelDescription(agentName: string): string {
+      const scopes = ["session", "project", "global"] as const;
+      const scope = scopes[this.currentTab];
+      if (scope === "session" && !getSessionArtifactDir(this.ctx)) return "Session unavailable (--no-session)";
+      try {
+        const config = getModelConfig(scope, this.ctx);
+        const override = Object.hasOwn(config, agentName) ? config[agentName] : undefined;
+        const agentModel = this.agents.find((agent) => agent.name === agentName)?.model;
+        const resolved = resolveSubagentModel(agentName, this.ctx, agentModel) ?? "Pi default";
+        if (override === "session") return `session (live parent) → ${resolved}`;
+        if (override && override !== "inherit") return `override: ${override}`;
+        return `inherit (cascade) → ${resolved}`;
+      } catch (error) {
+        const message = `Cannot load subagent models: ${error instanceof Error ? error.message : String(error)}`;
+        if (!this.reportedErrors.has(message)) {
+          this.reportedErrors.add(message);
+          this.ctx.ui.notify(message, "error");
+        }
+        return "Configuration unavailable";
+      }
+    }
+
+    private renderTabsHeader(): string {
+      const scopes = ["Session", "Project", "Global"];
+      return scopes
+        .map((scope, i) => {
+          const text = ` ${scope} `;
+          return i === this.currentTab
+            ? this.theme.fg("accent", this.theme.bold(text))
+            : this.theme.fg("muted", text);
+        })
+        .join("│");
+    }
+
+    private sessionEditingDisabled(): boolean {
+      if (this.currentTab !== 0 || getSessionArtifactDir(this.ctx)) return false;
+      this.ctx.ui.notify("Session settings are disabled with --no-session. Use the Project or Global tab instead.", "warning");
+      return true;
+    }
+
+    static async selectModel(ctx: ExtensionContext, agentName: string, tab: 0 | 1 | 2): Promise<string | null> {
+      const currentScope = (["session", "project", "global"] as const)[tab];
+      const config = getModelConfig(currentScope, ctx);
+      const current = Object.hasOwn(config, agentName) ? config[agentName] : undefined;
+
+      const inheritLabel = "inherit — follow lower scopes and agent defaults";
+      const sessionLabel = "session — always use the live parent model";
+      const customLabel = "Custom model… (provider/model-id)";
+      const models = [...new Set(ctx.modelRegistry.getAvailable().map((model) => `${model.provider}/${model.id}`))].sort();
+      const choice = await ctx.ui.select(
+        `Model for ${agentName} (${currentScope}; current: ${current ?? "inherit"})`,
+        [inheritLabel, sessionLabel, customLabel, ...models],
+      );
+      if (choice === undefined) return null;
+      if (choice === inheritLabel) return "inherit";
+      if (choice === sessionLabel) return "session";
+      if (choice === customLabel) {
+        // Mario's input() second argument is a placeholder, not initial text.
+        const custom = await ctx.ui.editor("Model: provider/model-id", current && current !== "inherit" && current !== "session" ? current : "");
+        if (custom === undefined) return null;
+        const model = custom.trim();
+        validateModelValue(model, "Custom model");
+        if (!/^[^\s/]+\/[^\s/]+(?:\/[^\s/]+)*$/.test(model)) {
+          throw new Error("Enter a model as provider/model-id (without spaces).");
+        }
+        return model;
+      }
+      return choice;
+    }
+
+    private refreshUI(): void {
+      this.buildSelectList();
+      this.invalidate();
+      this.tui.requestRender();
+    }
+
+    handleInput(data: string): void {
+      // Handle TAB key to switch tabs
+      if (this.kb.matches(data, "tui.input.tab") || matchesKey(data, "tab")) {
+        this.currentTab = ((this.currentTab + 1) % 3) as 0 | 1 | 2;
+        this.refreshUI();
+        return;
+      }
+
+      // Handle cancellation before delegating navigation to the list.
+      if (this.kb.matches(data, "tui.select.cancel") || matchesKey(data, "escape")) {
+        this.done(null);
+        return;
+      }
+
+      // Handle DELETE/BACKSPACE to remove override
+      if (matchesKey(data, "delete") || matchesKey(data, "backspace")) {
+        if (this.sessionEditingDisabled()) return;
+        const selected = this.selectList.getSelectedItem();
+        if (selected) {
+          const scope = (["session", "project", "global"] as const)[this.currentTab];
+          try {
+            setModelConfig(scope, selected.value, null, this.ctx);
+            this.ctx.ui.notify(`Removed ${scope} override for ${selected.value}`, "info");
+            this.refreshUI();
+          } catch (error) {
+            this.ctx.ui.notify(`Cannot remove override: ${error instanceof Error ? error.message : String(error)}`, "error");
+          }
+        }
+        return;
+      }
+
+      // Delegate to SelectList for navigation and selection
+      this.selectList.handleInput(data);
+      this.tui.requestRender();
+    }
+
+    render(width: number): string[] {
+      const header = this.renderTabsHeader();
+      const separator = this.theme.fg("dim", "─".repeat(Math.min(width, 68)));
+      const helpText = this.theme.fg(
+        "muted",
+        "↑↓ Select  Enter Edit  Del Remove  Tab Switch  Esc Exit",
+      );
+
+      const listLines = this.selectList.render(width);
+
+      return [
+        truncateToWidth(header, width),
+        truncateToWidth(separator, width),
+        ...(this.currentTab === 0 && !getSessionArtifactDir(this.ctx)
+          ? [truncateToWidth("Session disabled (--no-session); use Tab for Project/Global", width)] : []),
+        ...listLines.map((line) => truncateToWidth(line, width)),
+        "",
+        truncateToWidth(helpText, width),
+      ];
+    }
+
+    invalidate(): void {
+      this.selectList.invalidate();
+    }
+  }
+
+  /**
+   * Show the interactive subagent settings UI.
+   */
+  async function showSubagentSettings(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.hasUI) {
+      ctx.ui.notify("This command requires interactive mode", "error");
+      return;
+    }
+
+    let tab: 0 | 1 | 2 = 0;
+    let selectedName: string | undefined;
+    while (true) {
+      // Close the overlay before opening built-in dialogs, which use the editor's focus.
+      const action = await ctx.ui.custom<{ agentName: string; tab: 0 | 1 | 2 } | null>(
+        (tui, theme, kb, done) => new SubagentSettingsUI(tui, theme, kb, done, ctx, tab, selectedName),
+        { overlay: true, overlayOptions: { anchor: "center", width: 70, maxHeight: 20 } },
+      );
+      if (!action) return;
+      tab = action.tab;
+      selectedName = action.agentName;
+      const scope = (["session", "project", "global"] as const)[tab];
+      try {
+        const model = await SubagentSettingsUI.selectModel(ctx, selectedName, tab);
+        if (model !== null) {
+          setModelConfig(scope, selectedName, model, ctx);
+          ctx.ui.notify(`Saved ${scope} model for ${selectedName}`, "info");
+        }
+      } catch (error) {
+        ctx.ui.notify(`Cannot update subagent model: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    }
+  }
+
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
@@ -2333,7 +2716,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
+      const defs = loadAgentDefaults(agentName, ctx.cwd);
       if (!defs) {
         ctx.ui.notify(
           `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
@@ -2346,6 +2729,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /subagent-settings command — configure subagent models
+  pi.registerCommand("subagent-settings", {
+    description: "Configure subagent models (session/project/global)",
+    handler: async (_args, ctx) => {
+      try {
+        await showSubagentSettings(ctx);
+      } catch (error) {
+        ctx.ui.notify(`Cannot open subagent settings: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
     },
   });
 

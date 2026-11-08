@@ -2,7 +2,9 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**tmux-only fork with enhanced model management.** Pi subagents inherit the main session's model by default, with per-session, per-project, and global configuration support.
+
+See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
 ## How it works
 
@@ -25,6 +27,31 @@ If your shell startup is slow and launch commands get dropped before the prompt 
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 ```
 
+## Differences from Upstream
+
+This fork introduces the following changes:
+
+### Model Management
+- **Session-aware model inheritance**: Subagents use the main session's current model by default (via `/model` command)
+- **Three-tier configuration system**: Override models at session, project, or global scope
+- **Interactive settings UI**: `/subagent-settings` command provides a TUI for managing model configurations
+- **No hardcoded models**: Agent definitions no longer specify models in frontmatter—all agents inherit or use configured overrides
+
+### Installation & Agent Management
+- **Bundled fallback**: Packaged agents (scout, researcher, worker) are available without copying files into your home directory
+- **Discovery priority**: Parent project (`ctx.cwd`) → global → package-bundled; custom agents override bundled agents by name
+- **Non-destructive discovery**: Opening settings or discovering agents never installs or overwrites agent files
+
+### Configuration
+Model configurations are stored in JSON files at three scopes:
+- **Session**: `<sessionDir>/artifacts/<sessionId>/subagent-models.json` (session-specific, survives resume)
+- **Project**: `.pi/subagent-models.json` (version-controlled, team-shared)
+- **Global**: `~/.pi/agent/subagent-models.json` (personal, cross-project)
+
+Priority: Explicit spawn model > Session > Project > Global > Agent frontmatter > Live parent model > pi CLI default. Session paths come from the live session manager; `--no-session` disables only the Session scope.
+
+See the [original project](https://github.com/HazAT/pi-interactive-subagents) for the full-featured multi-multiplexer version with cmux, zellij, and WezTerm support.
+
 ## Tools
 
 | Tool | Description |
@@ -34,7 +61,12 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly.
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `/subagent <agent> <task>` | Spawn a subagent directly from command |
+| `/subagent-settings` | Interactive TUI for managing subagent model configurations |
 
 ### Spawning
 
@@ -48,7 +80,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
+| `model` | string | resolved model | Override the model for this spawn (bypasses configuration system) |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
 ### Messaging
@@ -74,11 +106,13 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 ## Bundled agents
 
-| Agent | Model | Tools | Role |
-| ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| Agent | Tools | Role |
+| ----- | ----- | ---- |
+| **scout** | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+
+> **Note**: All bundled agents inherit the main session's model by default. Use `/subagent-settings` to configure specific models for each agent at session, project, or global scope.
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -90,7 +124,6 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
@@ -106,7 +139,7 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model |
+| `model` | string | Agent fallback model, used after scoped overrides and before the live parent model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
@@ -118,6 +151,45 @@ You are a specialized agent that does X...
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
+
+### Model Configuration
+
+Use the `/subagent-settings` command to configure models for subagents interactively:
+
+```bash
+/subagent-settings
+```
+
+The TUI provides:
+- **Three tabs** (Session/Project/Global) — switch with `Tab`
+- **Agent list** — navigate with arrow keys
+- **Edit model** — press `Enter` to select an available registry model, choose an inheritance rule, or enter a custom model
+- **Remove override** — press `Delete` or `Backspace` to reset to default
+- **Real-time updates** — changes apply immediately
+
+**Resolution priority:**
+1. Explicit `model` parameter in `subagent()` call
+2. Session configuration (persistent for this session, including resume)
+3. Project configuration (`<parent cwd>/.pi/subagent-models.json`)
+4. Global configuration (`~/.pi/agent/subagent-models.json`)
+5. Agent frontmatter `model`
+6. Main session's **current** model (`ctx.model`, including later `/model` changes)
+7. No `--model` argument: let pi choose its CLI default
+
+Automatic live-parent model inheritance applies to Pi agents. Agents using `cli: claude` retain the Claude CLI default unless an explicit, scoped, or frontmatter model is configured; `session` deliberately selects the Pi parent's model even for those agents.
+
+A configuration value of `inherit` continues to the next scope. A value of `session` explicitly selects the live parent model, bypassing lower scopes and frontmatter. Removing an override also resumes normal cascading. Global paths respect `PI_CODING_AGENT_DIR` when set.
+
+Opening settings does not create configuration directories. Session configuration is unavailable with `--no-session`; Project and Global remain editable. Malformed JSON, invalid model values, and read/write failures are reported rather than silently replaced. Updates use an atomic file replacement.
+
+**Example configuration file** (`.pi/subagent-models.json`):
+```json
+{
+  "scout": "anthropic/claude-3.5-haiku",
+  "researcher": "openrouter/google/gemini-2.0-flash-exp",
+  "worker": "anthropic/claude-3.5-sonnet"
+}
+```
 
 ### session-mode
 
@@ -175,14 +247,21 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
-## Requirements
+## Installation
 
-- [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+```bash
+pi install pi-interactive-subagents
+```
 
+Or run from a local clone:
 ```bash
 tmux new -A -s pi 'pi'
 ```
+
+## Requirements
+
+- [Mario pi](https://github.com/badlogic/pi-mono), tested with `@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui` **0.65.0**
+- [tmux](https://github.com/tmux/tmux) (this fork does not support other multiplexers)
 
 ## Acknowledgements
 

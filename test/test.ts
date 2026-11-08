@@ -1,11 +1,18 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+// Unit tests model a top-level host, even when launched from a subagent pane.
+// The extension snapshots this permission boundary at module initialization.
+const inheritedAllowedAgents = process.env.PI_SUBAGENT_ALLOWED;
+delete process.env.PI_SUBAGENT_ALLOWED;
+const subagentsModule = await import("../pi-extension/subagents/index.ts");
+if (inheritedAllowedAgents !== undefined) process.env.PI_SUBAGENT_ALLOWED = inheritedAllowedAgents;
 
 import {
   getLeafId,
@@ -1068,6 +1075,18 @@ describe("status.ts", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("uses package agents as a non-copying fallback below project and global overrides", async () => {
+    await withIsolatedAgentEnv(({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+      const fallback = testApi.loadAgentDefaults("scout", projectDir);
+      assert.ok(fallback);
+      assert.equal(existsSync(join(globalAgentsDir, "scout.md")), false);
+      writeAgentFile(globalAgentsDir, "scout", "name: scout\nmodel: global/scout");
+      assert.equal(testApi.loadAgentDefaults("scout", projectDir).model, "global/scout");
+      writeAgentFile(projectAgentsDir, "scout", "name: scout\nmodel: project/scout");
+      assert.equal(testApi.loadAgentDefaults("scout", projectDir).model, "project/scout");
+    });
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1206,13 +1225,17 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps installed custom tools and skips built-ins", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const extension = join(globalDir, "extensions", "web-search", "index.ts");
+      mkdirSync(join(globalDir, "extensions", "web-search"), { recursive: true });
+      writeFileSync(extension, "export default function () {}\n");
+      assert.equal(testApi.getToolExtensionPath("read"), undefined);
+      assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+      assert.equal(testApi.getToolExtensionPath("web_search"), extension);
+      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+      assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1787,7 +1810,328 @@ describe("tmux.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
 });
+describe("model configuration with Mario session contexts", () => {
+  const helpers = subagentsModule.__test__;
+
+  it("resolves explicit > scoped config > frontmatter > live parent > CLI default", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const ctx = { cwd: projectDir, model: { provider: "parent", id: "one" }, sessionManager: SessionManager.create(projectDir, join(projectDir, "sessions")) };
+      assert.equal(helpers.resolveSubagentModel("custom", { cwd: projectDir }), undefined);
+      assert.equal(helpers.resolveSubagentModel("custom", ctx), "parent/one");
+      assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model"), "front/model");
+      for (const [scope, expected] of [["global", "global/model"], ["project", "project/model"], ["session", "session/model"]] as const) {
+        helpers.setModelConfig(scope, "custom", expected, ctx);
+        assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model"), expected);
+      }
+      assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model", "explicit/model"), "explicit/model");
+      helpers.setModelConfig("session", "custom", "inherit", ctx);
+      assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model"), "project/model");
+      helpers.setModelConfig("session", "custom", "session", ctx);
+      assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model"), "parent/one");
+      ctx.model = { provider: "parent", id: "two" };
+      assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model"), "parent/two");
+      assert.equal(helpers.resolveSubagentModel("custom", { ...ctx, model: undefined }, "front/model"), undefined);
+      helpers.setModelConfig("session", "custom", null, ctx);
+      helpers.setModelConfig("project", "custom", "inherit", ctx);
+      helpers.setModelConfig("global", "custom", "inherit", ctx);
+      assert.equal(helpers.resolveSubagentModel("custom", ctx, "front/model"), "front/model");
+    });
+  });
+
+  it("does not treat inherited Object properties as configured agent overrides", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const ctx = { cwd: projectDir, model: { provider: "parent", id: "model" } };
+      for (const agent of ["constructor", "toString", "__proto__"]) {
+        assert.equal(helpers.resolveSubagentModel(agent, ctx), "parent/model");
+        helpers.setModelConfig("project", agent, "custom/model", ctx);
+        assert.equal(helpers.resolveSubagentModel(agent, ctx), "custom/model");
+        helpers.setModelConfig("project", agent, null, ctx);
+        assert.equal(helpers.resolveSubagentModel(agent, ctx), "parent/model");
+      }
+    });
+  });
+
+  it("can omit automatic Pi parent inheritance for alternate CLIs without dropping deliberate overrides", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const ctx = { cwd: projectDir, model: { provider: "pi", id: "parent" } };
+      const options = { fallbackToParent: false };
+      assert.equal(helpers.resolveSubagentModel("claude-agent", ctx, undefined, undefined, options), undefined);
+      assert.equal(helpers.resolveSubagentModel("claude-agent", ctx, "claude/frontmatter", undefined, options), "claude/frontmatter");
+      helpers.setModelConfig("project", "claude-agent", "claude/scoped", ctx);
+      assert.equal(helpers.resolveSubagentModel("claude-agent", ctx, "claude/frontmatter", undefined, options), "claude/scoped");
+      assert.equal(helpers.resolveSubagentModel("claude-agent", ctx, undefined, "claude/explicit", options), "claude/explicit");
+      helpers.setModelConfig("project", "claude-agent", "session", ctx);
+      assert.equal(helpers.resolveSubagentModel("claude-agent", ctx, undefined, undefined, options), "pi/parent");
+    });
+  });
+
+  it("persists session config across a real SessionManager resume and follows session switches", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const sessionsDir = join(projectDir, "sessions");
+      const manager = SessionManager.create(projectDir, sessionsDir);
+      const ctx = { cwd: projectDir, sessionManager: manager };
+      const sessionFile = manager.getSessionFile()!;
+      // SessionManager delays writing its file until an assistant entry exists.
+      writeFileSync(sessionFile, JSON.stringify({ type: "session", version: 3, id: manager.getSessionId(), timestamp: new Date().toISOString(), cwd: projectDir }) + "\n");
+      helpers.setModelConfig("session", "scout", "saved/model", ctx);
+      const freshCtx = { cwd: projectDir, sessionManager: SessionManager.open(sessionFile) };
+      assert.deepEqual(helpers.getModelConfig("session", freshCtx), { scout: "saved/model" });
+      assert.equal(helpers.getSessionArtifactDir(freshCtx), helpers.getSessionArtifactDir(ctx));
+      manager.newSession();
+      assert.deepEqual(helpers.getModelConfig("session", ctx), {});
+      assert.notEqual(helpers.getSessionArtifactDir(ctx), helpers.getSessionArtifactDir(freshCtx));
+      assert.equal("session" in freshCtx, false);
+    });
+  });
+
+  it("uses parent ctx.cwd rather than process.cwd and path lookup creates nothing", async () => {
+    await withIsolatedAgentEnv(({ projectDir, globalDir }) => {
+      const parentDir = join(projectDir, "parent");
+      mkdirSync(parentDir);
+      const ctx = { cwd: parentDir, sessionManager: SessionManager.create(parentDir, join(projectDir, "sessions")) };
+      const artifactDir = helpers.getSessionArtifactDir(ctx)!;
+      assert.equal(existsSync(artifactDir), false);
+      helpers.getModelConfig("session", ctx);
+      assert.equal(existsSync(artifactDir), false);
+      helpers.setModelConfig("project", "scout", "parent/model", ctx);
+      assert.equal(existsSync(join(projectDir, ".pi", "subagent-models.json")), false);
+      assert.equal(helpers.getModelConfigPath("project", ctx), join(parentDir, ".pi", "subagent-models.json"));
+      assert.equal(helpers.getModelConfigPath("global", ctx), join(globalDir, "subagent-models.json"));
+      assert.equal(helpers.resolveSubagentModel("scout", ctx), "parent/model");
+    });
+  });
+
+  it("disables session writes in --no-session while retaining project/global scopes", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const ctx = { cwd: projectDir, sessionManager: SessionManager.inMemory(projectDir) };
+      assert.equal(ctx.sessionManager.getSessionFile(), undefined);
+      assert.equal(helpers.getSessionArtifactDir(ctx), undefined);
+      assert.deepEqual(helpers.getModelConfig("session", ctx), {});
+      assert.throws(() => helpers.setModelConfig("session", "scout", "test/model", ctx));
+      for (const scope of ["project", "global"] as const) {
+        helpers.setModelConfig(scope, "scout", "test/model", ctx);
+        assert.deepEqual(helpers.getModelConfig(scope, ctx), { scout: "test/model" });
+        helpers.setModelConfig(scope, "scout", null, ctx);
+        assert.deepEqual(helpers.getModelConfig(scope, ctx), {});
+      }
+    });
+  });
+
+  it("rejects invalid JSON, schema and IO failures instead of silently discarding overrides", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const ctx = { cwd: projectDir };
+      const path = helpers.getModelConfigPath("project", ctx)!;
+      mkdirSync(join(projectDir, ".pi"), { recursive: true });
+      for (const invalid of ["{", "null", "[]", '"model"', '{"scout":7}', '{"scout":null}', '{"scout":{}}']) {
+        writeFileSync(path, invalid);
+        assert.throws(() => helpers.getModelConfig("project", ctx), undefined, invalid);
+        assert.throws(() => helpers.setModelConfig("project", "worker", "new/model", ctx), undefined, invalid);
+        assert.equal(readFileSync(path, "utf8"), invalid, "failed updates must preserve original data");
+      }
+      rmSync(path);
+      mkdirSync(path); // Reading a directory is a deterministic IO failure, even as root.
+      assert.throws(() => helpers.getModelConfig("project", ctx));
+      assert.throws(() => helpers.setModelConfig("project", "scout", "test/model", ctx));
+      rmSync(path, { recursive: true });
+      rmSync(join(projectDir, ".pi"), { recursive: true });
+      writeFileSync(join(projectDir, ".pi"), "blocking file");
+      assert.throws(() => helpers.setModelConfig("project", "scout", "test/model", ctx));
+    });
+  });
+});
+
 describe("commands", () => {
+  it("/subagent-settings uses the real context and supports editing all scopes without eager directories", async () => {
+    const dir = createTestDir();
+    const cwd = process.cwd();
+    const agentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.chdir(dir);
+      process.env.PI_CODING_AGENT_DIR = join(dir, "global");
+      writeAgentFile(join(dir, "global", "agents"), "scout", "name: scout");
+      const { api, registeredCommands } = createMockExtensionApi();
+      subagentsModule.default(api as any);
+      const command = registeredCommands.find((item) => item.name === "subagent-settings");
+      assert.ok(command);
+      const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+      const kb = { matches: (data: string, key: string) => key === "tui.select.cancel" && data === "\u001b" };
+      let overlayCalls = 0;
+      let modelPickers = 0;
+      let overlayOpen = false;
+      let selectedName: string | undefined;
+      const ctx: any = {
+        hasUI: true,
+        cwd: dir,
+        model: { provider: "test", id: "current-model" },
+        sessionManager: SessionManager.create(dir, join(dir, "sessions")),
+        modelRegistry: { getAvailable: () => [{ provider: "test", id: "chosen-model" }] },
+        ui: {
+          notify: (text: string, severity: string) => assert.notEqual(severity, "error", text),
+          select: async (_title: string, options: string[]) => {
+            assert.equal(overlayOpen, false, "built-in dialog must open after closing settings overlay");
+            assert.ok(options.includes("test/chosen-model"));
+            assert.ok(options.some((value) => value.startsWith("inherit")));
+            assert.ok(options.some((value) => value.startsWith("session")));
+            modelPickers++;
+            return "test/chosen-model";
+          },
+          custom: async (factory: any) => {
+            overlayOpen = true;
+            let action: any = null;
+            const component = factory({ requestRender() {} }, theme, kb, (value: any) => { action = value; });
+            const call = overlayCalls++;
+            assert.ok(call < 4, "settings must exit after the scripted interactions");
+            assert.doesNotMatch(component.render(70).join("\n"), /unavailable|not available/);
+            assert.equal("session" in ctx, false, "do not synthesize unsupported context fields");
+            for (const width of [20, 40, 70]) {
+              assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width), JSON.stringify(component.render(width)));
+            }
+            if (call === 0) {
+              assert.equal(existsSync(subagentsModule.__test__.getSessionArtifactDir(ctx)!), false);
+              component.handleInput("\u001b[B");
+              selectedName = component.selectList.getSelectedItem()?.value;
+            } else {
+              const previousScope = (["session", "project", "global"] as const)[call - 1];
+              assert.equal(component.currentTab, call - 1);
+              assert.equal(component.selectList.getSelectedItem()?.value, selectedName, "reopened overlay retains agent selection");
+              assert.equal(subagentsModule.__test__.getModelConfig(previousScope, ctx)[selectedName!], "test/chosen-model");
+              component.handleInput("\u007f");
+              assert.deepEqual(subagentsModule.__test__.getModelConfig(previousScope, ctx), {});
+              assert.equal(component.selectList.getSelectedItem()?.value, selectedName);
+              component.handleInput("\t");
+            }
+            if (call < 3) component.handleInput("\r");
+            else component.handleInput("\u001b");
+            overlayOpen = false;
+            return action;
+          },
+        },
+      };
+      await command.handler("", ctx);
+      assert.equal(overlayCalls, 4);
+      assert.equal(modelPickers, 3);
+    } finally {
+      process.chdir(cwd);
+      restoreEnvVar("PI_CODING_AGENT_DIR", agentDir);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("/subagent-settings requires hasUI, not a synthetic mode field", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    subagentsModule.default(api);
+    const command = registeredCommands.find((item) => item.name === "subagent-settings");
+    const notices: string[] = [];
+    await command.handler("", { hasUI: false, mode: "tui", ui: {
+      notify: (text: string) => notices.push(text),
+      custom: () => assert.fail("headless contexts must not open overlays"),
+    } });
+    assert.ok(notices.length > 0);
+  });
+
+  it("/subagent-settings uses registry models and a prefilled editor with cancellation and validation", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir }) => {
+      const { api, registeredCommands } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const command = registeredCommands.find((item) => item.name === "subagent-settings");
+      let opens = 0;
+      let edits = 0;
+      const errors: string[] = [];
+      let agent: string;
+      const ctx: any = {
+        hasUI: true, cwd: projectDir,
+        sessionManager: SessionManager.create(projectDir, join(projectDir, "sessions")),
+        modelRegistry: { getAvailable: () => [] },
+        ui: {
+          notify: (text: string, severity: string) => { if (severity === "error") errors.push(text); },
+          select: async (_title: string, options: string[]) => {
+            assert.equal(options.length, 3, "no hardcoded registry model presets");
+            return opens <= 3 ? options.find((item) => item.startsWith("Custom")) : undefined;
+          },
+          editor: async (_title: string, prefill: string) => {
+            assert.equal(prefill, "old/model");
+            return [undefined, "/missing-provider", "new/model"][edits++];
+          },
+          custom: async (factory: any) => {
+            let action: any = null;
+            const component = factory({ requestRender() {} }, {
+              fg: (_color: string, text: string) => text, bold: (text: string) => text,
+            }, { matches: () => false }, (value: any) => { action = value; });
+            if (opens === 0) {
+              agent = component.selectList.getSelectedItem().value;
+              subagentsModule.__test__.setModelConfig("session", agent, "old/model", ctx);
+            }
+            if (opens > 0) {
+              assert.equal(subagentsModule.__test__.getModelConfig("session", ctx)[agent!], opens < 3 ? "old/model" : "new/model");
+            }
+            opens++;
+            assert.ok(opens <= 5);
+            component.handleInput(opens < 5 ? "\r" : "\u001b");
+            return action;
+          },
+        },
+      };
+      await command.handler("", ctx);
+      assert.equal(edits, 3);
+      assert.equal(opens, 5);
+      assert.equal(errors.length, 1, errors.join("\n"));
+    });
+  });
+
+  it("/subagent-settings disables Session for --no-session and keeps other tabs usable", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "ui-a", "name: ui-a");
+      writeAgentFile(projectAgentsDir, "ui-b", "name: ui-b");
+      const { api, registeredCommands } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const command = registeredCommands.find((item) => item.name === "subagent-settings");
+      const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+      const ctx = { hasUI: true, cwd: projectDir, sessionManager: SessionManager.inMemory(projectDir), ui: {
+        notify() {},
+        custom: async (factory: any) => {
+          const component = factory({ requestRender() {} }, theme, { matches: () => false }, () => {});
+          assert.match(component.render(90).join("\n"), /session.*(?:disabled|unavailable|not available)|(?:disabled|unavailable|not available).*session/i);
+          component.handleInput("\t");
+          component.handleInput("\u001b[B");
+          const selected = component.selectList.getSelectedItem()?.value;
+          assert.ok(selected);
+          component.handleInput("\u007f");
+          assert.equal(component.selectList.getSelectedItem()?.value, selected, "refresh must preserve selected agent");
+          component.handleInput("\t");
+          component.handleInput("\t");
+          assert.equal(subagentsModule.__test__.getSessionArtifactDir(ctx), undefined);
+          // A restricted host can discover no permitted agents. Exercise the
+          // actual component's empty-list path without hiding bundled agents.
+          component.agents = [];
+          component.buildSelectList();
+          for (const width of [10, 20, 70]) {
+            assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
+          }
+          assert.doesNotThrow(() => component.handleInput("\r"));
+          assert.doesNotThrow(() => component.handleInput("\u007f"));
+          return false;
+        },
+      } };
+      await command.handler("", ctx);
+      assert.equal("session" in ctx, false);
+    });
+  });
+
+  it("/subagent discovers a custom agent in ctx.cwd rather than process.cwd", async () => {
+    await withIsolatedAgentEnv(({ projectDir }) => {
+      const parentDir = join(projectDir, "parent");
+      writeAgentFile(join(parentDir, ".pi", "agents"), "parent-only", "name: parent-only");
+      const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+      subagentsModule.default(api);
+      registeredCommands.find((item) => item.name === "subagent").handler("parent-only scoped task", {
+        cwd: parentDir,
+        ui: { notify: () => assert.fail("parent cwd agent should be discoverable") },
+      });
+      assert.equal(sentUserMessages.length, 1);
+      assert.match(sentUserMessages[0], /parent-only/);
+    });
+  });
+
   it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
@@ -1830,24 +2174,45 @@ describe("tool registration", () => {
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
-    const result = await subagentTool.execute("call-1", { name: "x", task: "do it" });
+    const result = await subagentTool.execute("call-1", { name: "x", task: "do it" }, undefined, undefined, { cwd: process.cwd() });
     assert.equal(result.details?.error, "agent required");
     assert.match(result.content[0].text, /specify which agent/i);
   });
 
   it("rejects a top-level spawn naming an unknown agent", async () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
-    assert.ok(subagentTool, "expected subagent tool to be registered");
+    const previousAllowed = process.env.PI_SUBAGENT_ALLOWED;
+    delete process.env.PI_SUBAGENT_ALLOWED;
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
+      const result = await subagentTool.execute("call-1", {
+        name: "x", task: "do it", agent: "wizard",
+      }, undefined, undefined, { cwd: process.cwd() });
+      assert.equal(result.details?.error, "unknown agent");
+      assert.match(result.content[0].text, /not a known agent/i);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ALLOWED", previousAllowed);
+    }
+  });
 
-    const result = await subagentTool.execute("call-1", {
-      name: "x",
-      task: "do it",
-      agent: "wizard",
+  it("enforces a restricted subagent allowlist in a fresh host", () => {
+    const moduleUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
+    const script = `
+      const { default: extension } = await import(${JSON.stringify(moduleUrl)});
+      const tools = [];
+      extension({ on() {}, registerTool(t) { tools.push(t); }, registerCommand() {},
+        registerMessageRenderer() {}, registerShortcut() {}, getAllTools() { return []; } });
+      const result = await tools.find(t => t.name === 'subagent').execute('test',
+        { agent: 'worker', task: 'must be denied' }, undefined, undefined, { cwd: process.cwd() });
+      console.log(JSON.stringify(result.details));
+    `;
+    const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, PI_SUBAGENT_ALLOWED: "scout", PI_SUBAGENT_AGENT: "test-parent" },
+      encoding: "utf8", timeout: 10_000,
     });
-    assert.equal(result.details?.error, "unknown agent");
-    assert.match(result.content[0].text, /not a known agent/i);
+    assert.equal(JSON.parse(output.trim()).error, "agent not in allowlist");
   });
 
   it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
