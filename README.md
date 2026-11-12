@@ -6,6 +6,21 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
+## Installation
+
+Requires **pi 0.65.0** (tested) and **tmux** ([official installation guide](https://github.com/tmux/tmux/wiki/Installing)).
+
+```bash
+pi install npm:@ivannovr/pi-interactive-subagents
+```
+
+Run pi inside tmux:
+
+```bash
+tmux new -A -s pi
+pi
+```
+
 ## How it works
 
 `subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
@@ -252,20 +267,24 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
-## Installation
+## Development and releases
+
+Use **Node 24.21.0 / npm 11.19.0** for development and CI:
 
 ```bash
-pi install pi-interactive-subagents
+npm ci
+npm test
+npm run check:package
+npm run check:commits
 ```
 
-Or run from a local clone:
-```bash
-tmux new -A -s pi 'pi'
-```
+The default tests and installed-tarball checks do not call model providers or launch Pi/tmux sessions. `npm run test:integration` is a separate, manually opted-in real-session suite; it is not run by CI or release publication checks.
+
+New commits and PR titles use Conventional Commits. Imported history through `c3e8b53` is an explicit legacy boundary, not rewritten or treated as compliant. See [the maintainer release guide](docs/RELEASING.md) for the exact **3.7.2** bootstrap, disabled-by-default automation, trusted publishing, and recovery.
 
 ## Requirements
 
-- [Mario pi](https://github.com/badlogic/pi-mono), tested with `@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui` **0.65.0**
+- [pi](https://github.com/badlogic/pi-mono), tested with `@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui` **0.65.0**
 - [tmux](https://github.com/tmux/tmux) (this fork does not support other multiplexers)
 
 ## Acknowledgements

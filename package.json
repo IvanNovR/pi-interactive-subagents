@@ -1,5 +1,5 @@
 {
-  "name": "pi-interactive-subagents",
+  "name": "@ivannovr/pi-interactive-subagents",
   "version": "3.7.2",
   "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
   "keywords": [
@@ -7,13 +7,25 @@
   ],
   "license": "MIT",
   "author": "Amos Blomqvist",
+  "contributors": ["IvanNovR"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
+    "url": "git+https://github.com/IvanNovR/pi-interactive-subagents.git"
   },
+  "homepage": "https://github.com/IvanNovR/pi-interactive-subagents#readme",
+  "bugs": "https://github.com/IvanNovR/pi-interactive-subagents/issues",
+  "files": [
+    "pi-extension/subagents/",
+    "agents/*.md",
+    "config.json.example",
+    "CHANGELOG.md",
+    "docs/RELEASING.md"
+  ],
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
+    "test": "node --test test/test.ts test/system-prompt-mode.test.ts test/*.test.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "check:commits": "node scripts/check-commits.mjs",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {
