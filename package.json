@@ -7,7 +7,9 @@
   ],
   "license": "MIT",
   "author": "Amos Blomqvist",
-  "contributors": ["IvanNovR"],
+  "contributors": [
+    "IvanNovR"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/IvanNovR/pi-interactive-subagents.git"
