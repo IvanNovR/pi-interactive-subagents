@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { AuthStorage, initTheme, ModelRegistry, ModelSelectorComponent, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
+import { createSubagentModelSelector } from "../pi-extension/subagents/model-picker.ts";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { getKeybindings, visibleWidth } from "@mariozechner/pi-tui";
 // Unit tests model a top-level host, even when launched from a subagent pane.
 // The extension snapshots this permission boundary at module initialization.
 const inheritedAllowedAgents = process.env.PI_SUBAGENT_ALLOWED;
@@ -1940,81 +1941,161 @@ describe("model configuration with Mario session contexts", () => {
   });
 });
 
+function createModelRegistryFixture() {
+  initTheme("dark");
+  const auth = AuthStorage.inMemory();
+  auth.setRuntimeApiKey("inline-test", "unused-test-key");
+  const registry = ModelRegistry.inMemory(auth);
+  registry.registerProvider("inline-test", {
+    baseUrl: "https://example.invalid/v1",
+    apiKey: "unused-test-key",
+    api: "openai-completions",
+    models: ["alpha", "needle"].map((id) => ({
+      id, name: `Fixture ${id}`, reasoning: false, input: ["text" as const],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 4096, maxTokens: 512,
+    })),
+  });
+  return registry;
+}
+
+// The native Mario selector finishes loading its registry on a microtask.
+async function flushModelSelector() {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+describe("native subagent model selector", () => {
+  it("uses the real searchable selector, preselects the target, and isolates default settings", async () => {
+    const registry = createModelRegistryFixture();
+    const current = registry.find("inline-test", "alpha")!;
+    const hostSettings = SettingsManager.inMemory({ defaultProvider: "host", defaultModel: "unchanged" });
+    let selected: any;
+    let cancelled = 0;
+    const selector = createSubagentModelSelector({ requestRender() {} } as any,
+      { modelRegistry: registry, settingsManager: hostSettings } as any, current,
+      (model) => { selected = model; }, () => { cancelled++; });
+    assert.ok(selector instanceof ModelSelectorComponent, "reuse the host's native /model component");
+    await flushModelSelector();
+    assert.deepEqual((selector as any).filteredModels[(selector as any).selectedIndex].model, current);
+    for (const char of "inline-test/needle") selector.handleInput!(char);
+    assert.equal((selector as any).filteredModels.length, 1);
+    selector.handleInput!("\r");
+    assert.equal(selected.provider, "inline-test");
+    assert.equal(selected.id, "needle");
+    assert.notEqual((selector as any).settingsManager, hostSettings);
+    assert.equal((selector as any).settingsManager.getDefaultModel(), "needle", "native Mario save goes only to isolated settings");
+    assert.equal(hostSettings.getDefaultProvider(), "host");
+    assert.equal(hostSettings.getDefaultModel(), "unchanged");
+    assert.equal(cancelled, 0);
+    const cancelSelector = createSubagentModelSelector({ requestRender() {} } as any,
+      { modelRegistry: registry } as any, current, () => assert.fail("cancel must not select"), () => { cancelled++; });
+    await flushModelSelector();
+    cancelSelector.handleInput!("\u001b");
+    assert.equal(cancelled, 1);
+  });
+});
+
 describe("commands", () => {
-  it("/subagent-settings uses the real context and supports editing all scopes without eager directories", async () => {
-    const dir = createTestDir();
-    const cwd = process.cwd();
-    const agentDir = process.env.PI_CODING_AGENT_DIR;
-    try {
-      process.chdir(dir);
-      process.env.PI_CODING_AGENT_DIR = join(dir, "global");
-      writeAgentFile(join(dir, "global", "agents"), "scout", "name: scout");
+  it("/subagent-settings stays inline and writes only the selected scope through the native picker", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir }) => {
       const { api, registeredCommands } = createMockExtensionApi();
-      subagentsModule.default(api as any);
+      subagentsModule.default(api);
       const command = registeredCommands.find((item) => item.name === "subagent-settings");
-      assert.ok(command);
+      const registry = createModelRegistryFixture();
+      const parent = registry.find("inline-test", "alpha")!;
       const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-      const kb = { matches: (data: string, key: string) => key === "tui.select.cancel" && data === "\u001b" };
-      let overlayCalls = 0;
-      let modelPickers = 0;
-      let overlayOpen = false;
-      let selectedName: string | undefined;
+      let opens = 0;
+      let selectedAgent: string | undefined;
       const ctx: any = {
-        hasUI: true,
-        cwd: dir,
-        model: { provider: "test", id: "current-model" },
-        sessionManager: SessionManager.create(dir, join(dir, "sessions")),
-        modelRegistry: { getAvailable: () => [{ provider: "test", id: "chosen-model" }] },
+        hasUI: true, cwd: projectDir, model: parent, modelRegistry: registry,
+        sessionManager: SessionManager.create(projectDir, join(projectDir, "sessions")),
         ui: {
           notify: (text: string, severity: string) => assert.notEqual(severity, "error", text),
-          select: async (_title: string, options: string[]) => {
-            assert.equal(overlayOpen, false, "built-in dialog must open after closing settings overlay");
-            assert.ok(options.includes("test/chosen-model"));
-            assert.ok(options.some((value) => value.startsWith("inherit")));
-            assert.ok(options.some((value) => value.startsWith("session")));
-            modelPickers++;
-            return "test/chosen-model";
-          },
-          custom: async (factory: any) => {
-            overlayOpen = true;
-            let action: any = null;
-            const component = factory({ requestRender() {} }, theme, kb, (value: any) => { action = value; });
-            const call = overlayCalls++;
-            assert.ok(call < 4, "settings must exit after the scripted interactions");
-            assert.doesNotMatch(component.render(70).join("\n"), /unavailable|not available/);
-            assert.equal("session" in ctx, false, "do not synthesize unsupported context fields");
-            for (const width of [20, 40, 70]) {
-              assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width), JSON.stringify(component.render(width)));
-            }
-            if (call === 0) {
-              assert.equal(existsSync(subagentsModule.__test__.getSessionArtifactDir(ctx)!), false);
-              component.handleInput("\u001b[B");
-              selectedName = component.selectList.getSelectedItem()?.value;
+          select: () => assert.fail("do not replace native /model with ui.select"),
+          custom: async (factory: any, ...options: any[]) => {
+            assert.deepEqual(options, [], "every settings screen must mount inline without overlay options");
+            let result: any;
+            const component = await factory({ requestRender() {} }, theme, getKeybindings(), (value: any) => { result = value; });
+            const call = opens++;
+            assert.ok(call < 10, "bounded scripted flow");
+            await flushModelSelector();
+            if (component instanceof ModelSelectorComponent) {
+              assert.equal(call % 3, 2);
+              assert.deepEqual((component as any).currentModel, parent, "preselect the agent's effective model");
+              for (const char of "inline-test/needle") component.handleInput(char);
+              assert.equal((component as any).filteredModels.length, 1);
+              component.handleInput("\r");
+            } else if (call % 3 === 1) {
+              assert.match(component.render(90).join("\n"), /Choose model/);
+              component.handleInput("\r");
             } else {
-              const previousScope = (["session", "project", "global"] as const)[call - 1];
-              assert.equal(component.currentTab, call - 1);
-              assert.equal(component.selectList.getSelectedItem()?.value, selectedName, "reopened overlay retains agent selection");
-              assert.equal(subagentsModule.__test__.getModelConfig(previousScope, ctx)[selectedName!], "test/chosen-model");
-              component.handleInput("\u007f");
-              assert.deepEqual(subagentsModule.__test__.getModelConfig(previousScope, ctx), {});
-              assert.equal(component.selectList.getSelectedItem()?.value, selectedName);
-              component.handleInput("\t");
+              const scopeIndex = call / 3;
+              for (const width of [10, 20, 40, 70]) {
+                assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
+              }
+              if (call === 0) {
+                assert.equal(existsSync(subagentsModule.__test__.getSessionArtifactDir(ctx)!), false);
+                component.handleInput("\u001b[B");
+              } else {
+                const previousScope = (["session", "project", "global"] as const)[scopeIndex - 1];
+                const config = subagentsModule.__test__.getModelConfig(previousScope, ctx);
+                assert.equal(Object.keys(config).length, 1);
+                selectedAgent ??= Object.keys(config)[0];
+                assert.deepEqual(config, { [selectedAgent!]: "inline-test/needle" });
+                const selectedLine = component.render(160).find((line: string) => /^(?:\u001b\[[0-9;]*m)*→/.test(line.trim()));
+                assert.equal(selectedLine?.includes(selectedAgent!), true, "back navigation retains selected agent");
+                component.handleInput("\u007f");
+                assert.deepEqual(subagentsModule.__test__.getModelConfig(previousScope, ctx), {});
+                component.handleInput("\t");
+              }
+              component.handleInput(call < 9 ? "\r" : "\u001b");
             }
-            if (call < 3) component.handleInput("\r");
-            else component.handleInput("\u001b");
-            overlayOpen = false;
-            return action;
+            assert.equal(ctx.model, parent, "subagent configuration must never switch the main model");
+            assert.equal("session" in ctx, false, "do not synthesize unsupported context fields");
+            return result;
           },
         },
       };
       await command.handler("", ctx);
-      assert.equal(overlayCalls, 4);
-      assert.equal(modelPickers, 3);
-    } finally {
-      process.chdir(cwd);
-      restoreEnvVar("PI_CODING_AGENT_DIR", agentDir);
-      rmSync(dir, { recursive: true, force: true });
-    }
+      assert.equal(opens, 10);
+      for (const scope of ["session", "project", "global"] as const) assert.deepEqual(subagentsModule.__test__.getModelConfig(scope, ctx), {});
+    });
+  });
+
+  it("/subagent-settings handles an empty permitted-agent list inline at narrow widths", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir }) => {
+      const previousAllowed = process.env.PI_SUBAGENT_ALLOWED;
+      process.env.PI_SUBAGENT_ALLOWED = "no-such-permitted-agent";
+      let restricted: typeof subagentsModule;
+      try {
+        restricted = await import("../pi-extension/subagents/index.ts?empty-settings-test");
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_ALLOWED", previousAllowed);
+      }
+      const { api, registeredCommands } = createMockExtensionApi();
+      restricted.default(api);
+      const command = registeredCommands.find((item) => item.name === "subagent-settings");
+      let opens = 0;
+      await command.handler("", {
+        hasUI: true, cwd: projectDir, sessionManager: SessionManager.inMemory(projectDir),
+        ui: {
+          notify() {},
+          custom: async (factory: any, ...options: any[]) => {
+            assert.deepEqual(options, []);
+            assert.equal(++opens, 1);
+            let result: any;
+            const component = await factory({ requestRender() {} }, {
+              fg: (_color: string, text: string) => text, bold: (text: string) => text,
+            }, getKeybindings(), (value: any) => { result = value; });
+            for (const width of [1, 10, 20, 70]) assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
+            for (const key of ["\t", "\u001b[B", "\r", "\u007f"]) assert.doesNotThrow(() => component.handleInput(key));
+            assert.equal(result, undefined, "empty list must not open actions");
+            component.handleInput("\u001b");
+            return result;
+          },
+        },
+      });
+    });
   });
 
   it("/subagent-settings requires hasUI, not a synthetic mode field", async () => {
@@ -2029,7 +2110,7 @@ describe("commands", () => {
     assert.ok(notices.length > 0);
   });
 
-  it("/subagent-settings uses registry models and a prefilled editor with cancellation and validation", async () => {
+  it("/subagent-settings preserves overrides on native/editor cancel and validates the prefilled custom editor", async () => {
     await withIsolatedAgentEnv(async ({ projectDir }) => {
       const { api, registeredCommands } = createMockExtensionApi();
       subagentsModule.default(api);
@@ -2037,43 +2118,56 @@ describe("commands", () => {
       let opens = 0;
       let edits = 0;
       const errors: string[] = [];
-      let agent: string;
+      const agent = "researcher"; // bundled agents sort alphabetically
+      const registry = createModelRegistryFixture();
+      const savedModel = "inline-test/alpha";
       const ctx: any = {
-        hasUI: true, cwd: projectDir,
+        hasUI: true, cwd: projectDir, modelRegistry: registry,
+        model: registry.find("inline-test", "needle"),
         sessionManager: SessionManager.create(projectDir, join(projectDir, "sessions")),
-        modelRegistry: { getAvailable: () => [] },
         ui: {
           notify: (text: string, severity: string) => { if (severity === "error") errors.push(text); },
-          select: async (_title: string, options: string[]) => {
-            assert.equal(options.length, 3, "no hardcoded registry model presets");
-            return opens <= 3 ? options.find((item) => item.startsWith("Custom")) : undefined;
-          },
+          select: () => assert.fail("all actions must be inline"),
           editor: async (_title: string, prefill: string) => {
-            assert.equal(prefill, "old/model");
+            assert.equal(prefill, savedModel);
+            assert.deepEqual(subagentsModule.__test__.getModelConfig("session", ctx), { [agent]: savedModel });
             return [undefined, "/missing-provider", "new/model"][edits++];
           },
-          custom: async (factory: any) => {
-            let action: any = null;
-            const component = factory({ requestRender() {} }, {
+          custom: async (factory: any, ...options: any[]) => {
+            assert.deepEqual(options, [], "no centered overlays at any stage");
+            let action: any;
+            const component = await factory({ requestRender() {} }, {
               fg: (_color: string, text: string) => text, bold: (text: string) => text,
-            }, { matches: () => false }, (value: any) => { action = value; });
-            if (opens === 0) {
-              agent = component.selectList.getSelectedItem().value;
-              subagentsModule.__test__.setModelConfig("session", agent, "old/model", ctx);
+            }, getKeybindings(), (value: any) => { action = value; });
+            const call = opens++;
+            assert.ok(call < 7, "bounded scripted cancellation/editor flow");
+            await flushModelSelector();
+            if (call === 0) component.handleInput("\r"); // root -> actions
+            else if (call === 1) component.handleInput("\r"); // actions -> native
+            else if (call === 2) {
+              assert.ok(component instanceof ModelSelectorComponent);
+              assert.equal((component as any).currentModel.id, "alpha", "preselect the scoped override, not the main session model");
+              assert.equal((component as any).filteredModels[(component as any).selectedIndex].id, "alpha");
+              component.handleInput("\t"); // native Tab must not change the settings scope
+              component.handleInput("\u001b");
+            } else if (call < 6) {
+              assert.deepEqual(subagentsModule.__test__.getModelConfig("session", ctx), { [agent]: savedModel });
+              assert.match(component.render(100).join("\n"), /Custom model/);
+              // Cancelling a native picker/editor retains the action selection.
+              if (call === 3) for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
+              component.handleInput("\r");
+            } else {
+              assert.deepEqual(subagentsModule.__test__.getModelConfig("session", ctx), { [agent]: "new/model" });
+              component.handleInput("\u001b");
             }
-            if (opens > 0) {
-              assert.equal(subagentsModule.__test__.getModelConfig("session", ctx)[agent!], opens < 3 ? "old/model" : "new/model");
-            }
-            opens++;
-            assert.ok(opens <= 5);
-            component.handleInput(opens < 5 ? "\r" : "\u001b");
             return action;
           },
         },
       };
+      subagentsModule.__test__.setModelConfig("session", agent, savedModel, ctx);
       await command.handler("", ctx);
       assert.equal(edits, 3);
-      assert.equal(opens, 5);
+      assert.equal(opens, 7);
       assert.equal(errors.length, 1, errors.join("\n"));
     });
   });
@@ -2088,28 +2182,27 @@ describe("commands", () => {
       const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
       const ctx = { hasUI: true, cwd: projectDir, sessionManager: SessionManager.inMemory(projectDir), ui: {
         notify() {},
-        custom: async (factory: any) => {
-          const component = factory({ requestRender() {} }, theme, { matches: () => false }, () => {});
+        custom: async (factory: any, ...options: any[]) => {
+          assert.deepEqual(options, []);
+          let result: any;
+          const component = await factory({ requestRender() {} }, theme, getKeybindings(), (value: any) => { result = value; });
           assert.match(component.render(90).join("\n"), /session.*(?:disabled|unavailable|not available)|(?:disabled|unavailable|not available).*session/i);
+          component.handleInput("\r");
+          assert.equal(result, undefined, "disabled Session must not open actions");
           component.handleInput("\t");
           component.handleInput("\u001b[B");
-          const selected = component.selectList.getSelectedItem()?.value;
-          assert.ok(selected);
+          const selected = component.render(160).find((line: string) => /^(?:\u001b\[[0-9;]*m)*→/.test(line.trim()));
           component.handleInput("\u007f");
-          assert.equal(component.selectList.getSelectedItem()?.value, selected, "refresh must preserve selected agent");
+          assert.ok(selected, "settings shows a selected agent");
+          assert.equal(component.render(160).find((line: string) => /^(?:\u001b\[[0-9;]*m)*→/.test(line.trim())), selected, "refresh must preserve selected agent");
           component.handleInput("\t");
           component.handleInput("\t");
           assert.equal(subagentsModule.__test__.getSessionArtifactDir(ctx), undefined);
-          // A restricted host can discover no permitted agents. Exercise the
-          // actual component's empty-list path without hiding bundled agents.
-          component.agents = [];
-          component.buildSelectList();
           for (const width of [10, 20, 70]) {
             assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
           }
-          assert.doesNotThrow(() => component.handleInput("\r"));
-          assert.doesNotThrow(() => component.handleInput("\u007f"));
-          return false;
+          component.handleInput("\u001b");
+          return result;
         },
       } };
       await command.handler("", ctx);

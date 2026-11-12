@@ -34,7 +34,7 @@ This fork introduces the following changes:
 ### Model Management
 - **Session-aware model inheritance**: Subagents use the main session's current model by default (via `/model` command)
 - **Three-tier configuration system**: Override models at session, project, or global scope
-- **Interactive settings UI**: `/subagent-settings` command provides a TUI for managing model configurations
+- **Inline settings UI**: `/subagent-settings` uses Pi's editor region, with scoped settings and the native searchable `/model` picker
 - **No hardcoded models**: Agent definitions no longer specify models in frontmatter—all agents inherit or use configured overrides
 
 ### Installation & Agent Management
@@ -160,12 +160,17 @@ Use the `/subagent-settings` command to configure models for subagents interacti
 /subagent-settings
 ```
 
-The TUI provides:
-- **Three tabs** (Session/Project/Global) — switch with `Tab`
-- **Agent list** — navigate with arrow keys
-- **Edit model** — press `Enter` to select an available registry model, choose an inheritance rule, or enter a custom model
-- **Remove override** — press `Delete` or `Backspace` to reset to default
-- **Real-time updates** — changes apply immediately
+The entire flow stays inline in Pi's editor region—there are no centered overlays:
+- **Three scope tabs** (Session/Project/Global) — switch with `Tab`
+- **Agent settings** — navigate with arrow keys and press `Enter` to open that agent's actions
+- **Choose model** — opens Pi's native `/model` selector, including its search and keyboard navigation, with the agent's effective model preselected when available
+- **Scoped actions** — continue the inheritance cascade (`inherit`), explicitly follow the live parent (`session`), enter a custom model string, or remove the override; these are separate from the native model list
+- **Remove shortcut** — `Delete` or `Backspace` on the agent settings list removes the selected scope's override
+- **Custom model editor** — starts with the existing override and validates the model string before saving
+- **Back navigation** — `Escape` returns to the previous screen without saving; the selected agent and scope are retained
+- **Immediate, scoped updates** — successful edits affect only that agent in the selected scope, never the main session's model or Pi's default model settings
+
+The native selector lists the models available through Pi's model registry. Use the custom editor for a model identifier not listed there. Cancelling either picker or editor leaves existing overrides unchanged.
 
 **Resolution priority:**
 1. Explicit `model` parameter in `subagent()` call

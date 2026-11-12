@@ -1,8 +1,10 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import { DynamicBorder, getSettingsListTheme, keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { SelectList, matchesKey, type SelectItem } from "@mariozechner/pi-tui";
+import { SettingsList, matchesKey, type SettingItem } from "@mariozechner/pi-tui";
+import * as tuiComponents from "@mariozechner/pi-tui";
+import { createSubagentModelSelector } from "./model-picker.ts";
 import type { Component, TUI, KeybindingsManager } from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2475,7 +2477,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   class SubagentSettingsUI implements Component {
     private currentTab: 0 | 1 | 2 = 0; // Session=0, Project=1, Global=2
     private agents: ListedAgentDefinition[];
-    private selectList!: SelectList;
+    private settingsList!: SettingsList;
+    private items: SettingItem[] = [];
+    private selectedIndex = 0;
+    private readonly maxVisible = 12;
     private tui: TUI;
     private theme: Theme;
     private kb: KeybindingsManager;
@@ -2490,7 +2495,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       done: (result: { agentName: string; tab: 0 | 1 | 2 } | null) => void,
       ctx: ExtensionContext,
       tab: 0 | 1 | 2 = 0,
-      selectedName?: string,
     ) {
       this.tui = tui;
       this.theme = theme;
@@ -2499,36 +2503,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       this.ctx = ctx;
       this.currentTab = tab;
       this.agents = discoverAgentDefinitions(ctx.cwd);
-      this.buildSelectList();
-      const index = this.agents.findIndex((agent) => agent.name === selectedName);
-      if (index >= 0) this.selectList.setSelectedIndex(index);
+      this.buildSettingsList();
     }
 
-    private buildSelectList(): void {
-      const selectedName = this.selectList?.getSelectedItem()?.value;
-      const items = this.agents.map((agent): SelectItem => ({
-        value: agent.name,
+    private buildSettingsList(): void {
+      this.items = this.agents.map((agent): SettingItem => ({
+        id: agent.name,
         label: agent.name,
-        description: this.getModelDescription(agent.name),
+        currentValue: this.getModelDescription(agent.name),
+        description: agent.description,
+        values: ["edit"],
       }));
+      this.settingsList = new SettingsList(
+        this.items, this.maxVisible, getSettingsListTheme(),
+        (agentName) => {
+          this.selectedIndex = this.items.findIndex((item) => item.id === agentName);
+          this.refreshUI();
+          if (!this.sessionEditingDisabled()) this.done({ agentName, tab: this.currentTab });
+        },
+        () => this.done(null),
+      );
+    }
 
-      this.selectList = new SelectList(items, Math.min(items.length + 2, 12), {
-        selectedPrefix: (text) => this.theme.fg("accent", text),
-        selectedText: (text) => this.theme.fg("accent", text),
-        description: (text) => this.theme.fg("muted", text),
-        scrollInfo: (text) => this.theme.fg("muted", text),
-        noMatch: (text) => this.theme.fg("muted", text),
-      });
-
-      const selectedIndex = items.findIndex((item) => item.value === selectedName);
-      if (selectedIndex >= 0) this.selectList.setSelectedIndex(selectedIndex);
-      this.selectList.onSelect = (item) => {
-        if (!this.sessionEditingDisabled()) this.done({ agentName: item.value, tab: this.currentTab });
-      };
-
-      this.selectList.onCancel = () => {
-        this.done(null);
-      };
+    // Retain the list and its mirrored selection across child screens/scopes.
+    // Legacy hosts expose no selection setter or getter.
+    resume(done: (result: { agentName: string; tab: 0 | 1 | 2 } | null) => void): void {
+      this.done = done;
+      this.refreshUI();
     }
 
     private getModelDescription(agentName: string): string {
@@ -2571,38 +2572,82 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return true;
     }
 
-    static async selectModel(ctx: ExtensionContext, agentName: string, tab: 0 | 1 | 2): Promise<string | null> {
-      const currentScope = (["session", "project", "global"] as const)[tab];
-      const config = getModelConfig(currentScope, ctx);
+    static async selectModel(ctx: ExtensionContext, agentName: string, tab: 0 | 1 | 2): Promise<{ value: string | null } | null> {
+      const scope = (["session", "project", "global"] as const)[tab];
+      // Read before presenting actions; corrupt config must never be overwritten.
+      const config = getModelConfig(scope, ctx);
       const current = Object.hasOwn(config, agentName) ? config[agentName] : undefined;
-
-      const inheritLabel = "inherit — follow lower scopes and agent defaults";
-      const sessionLabel = "session — always use the live parent model";
-      const customLabel = "Custom model… (provider/model-id)";
-      const models = [...new Set(ctx.modelRegistry.getAvailable().map((model) => `${model.provider}/${model.id}`))].sort();
-      const choice = await ctx.ui.select(
-        `Model for ${agentName} (${currentScope}; current: ${current ?? "inherit"})`,
-        [inheritLabel, sessionLabel, customLabel, ...models],
-      );
-      if (choice === undefined) return null;
-      if (choice === inheritLabel) return "inherit";
-      if (choice === sessionLabel) return "session";
-      if (choice === customLabel) {
-        // Mario's input() second argument is a placeholder, not initial text.
-        const custom = await ctx.ui.editor("Model: provider/model-id", current && current !== "inherit" && current !== "session" ? current : "");
-        if (custom === undefined) return null;
-        const model = custom.trim();
-        validateModelValue(model, "Custom model");
-        if (!/^[^\s/]+\/[^\s/]+(?:\/[^\s/]+)*$/.test(model)) {
-          throw new Error("Enter a model as provider/model-id (without spaces).");
+      const actions: SettingItem[] = [
+        { id: "model", label: "Choose model…", currentValue: "", description: "Open Pi's native model selector.", values: ["select"] },
+        { id: "inherit", label: "Inherit next level", currentValue: "inherit", description: "Follow lower scopes and agent defaults.", values: ["select"] },
+        { id: "session", label: "Use live parent model", currentValue: "session", description: "Always use the live parent model, bypassing lower scopes.", values: ["select"] },
+        { id: "custom", label: "Custom model…", currentValue: "provider/model-id", values: ["select"] },
+        { id: "remove", label: "Remove override", currentValue: "", description: `Remove this agent's ${scope} override.`, values: ["select"] },
+      ];
+      let completeAction: (value: string | null) => void = () => {};
+      const initialValues = actions.map((action) => action.currentValue);
+      const list = new SettingsList(actions, 8, getSettingsListTheme(),
+        (id) => completeAction(id), () => completeAction(null));
+      while (true) {
+        const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+          completeAction = done;
+          actions.forEach((action, index) => list.updateValue(action.id, initialValues[index]));
+          const border = new DynamicBorder((text) => theme.fg("border", text));
+          return {
+            capturesViewportInput: true,
+            render: (width: number) => [
+              ...border.render(width),
+              truncateToWidth(theme.fg("accent", theme.bold(`Model for ${agentName} (${scope})`)), width),
+              truncateToWidth(theme.fg("muted", `Current: ${current ?? "inherit"}`), width),
+              "", ...list.render(width), ...border.render(width),
+            ],
+            handleInput: (data: string) => { list.handleInput(data); tui.requestRender(); },
+            invalidate: () => list.invalidate(),
+          };
+        });
+        if (choice === null || choice === undefined) return null;
+        if (choice === "inherit" || choice === "session") return { value: choice };
+        if (choice === "remove") return { value: null };
+        if (choice === "model") {
+          const agentModel = discoverAgentDefinitions(ctx.cwd).find((agent) => agent.name === agentName)?.model;
+          const effective = current && current !== "inherit" && current !== "session"
+            ? current : resolveSubagentModel(agentName, ctx, agentModel);
+          let targetModel = effective ? undefined : ctx.model;
+          if (effective) {
+            const slash = effective.indexOf("/");
+            if (slash > 0) targetModel = ctx.modelRegistry.find(effective.slice(0, slash), effective.slice(slash + 1));
+            else targetModel = ctx.modelRegistry.getAvailable().find((model) => model.id === effective);
+          }
+          // No wrapper intercepts input: Tab and all native search/navigation
+          // keys belong exclusively to the stock /model component.
+          const selected = await ctx.ui.custom<string | null>((tui, _theme, _kb, done) =>
+            createSubagentModelSelector(tui, ctx, targetModel,
+              (model) => done(`${model.provider}/${model.id}`), () => done(null)),
+          );
+          if (selected) return { value: selected };
+          continue;
         }
-        return model;
+        if (choice === "custom") {
+          const custom = await ctx.ui.editor("Model: provider/model-id", current && current !== "inherit" && current !== "session" ? current : "");
+          if (custom === undefined) continue;
+          const model = custom.trim();
+          try {
+            validateModelValue(model, "Custom model");
+            if (!/^[^\s/]+\/[^\s/]+(?:\/[^\s/]+)*$/.test(model)) {
+              throw new Error("Enter a model as provider/model-id (without spaces).");
+            }
+            return { value: model };
+          } catch (error) {
+            ctx.ui.notify(`Cannot update subagent model: ${error instanceof Error ? error.message : String(error)}`, "error");
+          }
+        }
       }
-      return choice;
     }
 
     private refreshUI(): void {
-      this.buildSelectList();
+      for (const item of this.items) {
+        this.settingsList.updateValue(item.id, this.getModelDescription(item.id));
+      }
       this.invalidate();
       this.tui.requestRender();
     }
@@ -2624,48 +2669,68 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Handle DELETE/BACKSPACE to remove override
       if (matchesKey(data, "delete") || matchesKey(data, "backspace")) {
         if (this.sessionEditingDisabled()) return;
-        const selected = this.selectList.getSelectedItem();
-        if (selected) {
-          const scope = (["session", "project", "global"] as const)[this.currentTab];
-          try {
-            setModelConfig(scope, selected.value, null, this.ctx);
-            this.ctx.ui.notify(`Removed ${scope} override for ${selected.value}`, "info");
-            this.refreshUI();
-          } catch (error) {
-            this.ctx.ui.notify(`Cannot remove override: ${error instanceof Error ? error.message : String(error)}`, "error");
-          }
+        const agentName = this.items[this.selectedIndex]?.id;
+        if (!agentName) return;
+        const scope = (["session", "project", "global"] as const)[this.currentTab];
+        try {
+          setModelConfig(scope, agentName, null, this.ctx);
+          this.ctx.ui.notify(`Removed ${scope} override for ${agentName}`, "info");
+        } catch (error) {
+          this.ctx.ui.notify(`Cannot remove override: ${error instanceof Error ? error.message : String(error)}`, "error");
         }
+        this.refreshUI();
         return;
       }
 
-      // Delegate to SelectList for navigation and selection
-      this.selectList.handleInput(data);
+      // Mirror only native navigation, using the list's own keybinding registry
+      // and precedence. Modern hosts page by maxVisible; Mario has no paging.
+      // Namespace detection avoids importing an export absent on legacy hosts.
+      const kb = tuiComponents.getKeybindings();
+      const getSelectPageIndex = (tuiComponents as typeof tuiComponents & {
+        getSelectPageIndex?: (kb: KeybindingsManager, data: string, index: number, count: number, pageSize: number) => number | undefined;
+      }).getSelectPageIndex;
+      const count = this.items.length;
+      const pageIndex = getSelectPageIndex?.(kb, data, this.selectedIndex, count, this.maxVisible);
+      if (count > 0) {
+        if (kb.matches(data, "tui.select.up")) {
+          this.selectedIndex = this.selectedIndex === 0 ? count - 1 : this.selectedIndex - 1;
+        } else if (kb.matches(data, "tui.select.down")) {
+          this.selectedIndex = this.selectedIndex === count - 1 ? 0 : this.selectedIndex + 1;
+        } else if (pageIndex !== undefined) {
+          this.selectedIndex = pageIndex;
+        }
+      }
+      // Search remains disabled so Backspace unambiguously removes overrides.
+      this.settingsList.handleInput(data);
       this.tui.requestRender();
     }
 
     render(width: number): string[] {
       const header = this.renderTabsHeader();
-      const separator = this.theme.fg("dim", "─".repeat(Math.min(width, 68)));
+      const border = new DynamicBorder((text) => this.theme.fg("border", text));
       const helpText = this.theme.fg(
         "muted",
         "↑↓ Select  Enter Edit  Del Remove  Tab Switch  Esc Exit",
       );
 
-      const listLines = this.selectList.render(width);
+      const listLines = this.settingsList.render(width);
 
       return [
+        ...border.render(width),
+        truncateToWidth(this.theme.fg("accent", this.theme.bold("Subagent model settings")), width),
         truncateToWidth(header, width),
-        truncateToWidth(separator, width),
+        "",
         ...(this.currentTab === 0 && !getSessionArtifactDir(this.ctx)
           ? [truncateToWidth("Session disabled (--no-session); use Tab for Project/Global", width)] : []),
         ...listLines.map((line) => truncateToWidth(line, width)),
         "",
         truncateToWidth(helpText, width),
+        ...border.render(width),
       ];
     }
 
     invalidate(): void {
-      this.selectList.invalidate();
+      this.settingsList.invalidate();
     }
   }
 
@@ -2673,28 +2738,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
    * Show the interactive subagent settings UI.
    */
   async function showSubagentSettings(ctx: ExtensionContext): Promise<void> {
-    if (!ctx.hasUI) {
+    if (!ctx.hasUI || (ctx.mode !== undefined && ctx.mode !== "tui")) {
       ctx.ui.notify("This command requires interactive mode", "error");
       return;
     }
 
-    let tab: 0 | 1 | 2 = 0;
-    let selectedName: string | undefined;
+    let root: SubagentSettingsUI | undefined;
     while (true) {
-      // Close the overlay before opening built-in dialogs, which use the editor's focus.
+      // Sequential inline screens replace the editor area, never the footer.
       const action = await ctx.ui.custom<{ agentName: string; tab: 0 | 1 | 2 } | null>(
-        (tui, theme, kb, done) => new SubagentSettingsUI(tui, theme, kb, done, ctx, tab, selectedName),
-        { overlay: true, overlayOptions: { anchor: "center", width: 70, maxHeight: 20 } },
+        (tui, theme, kb, done) => {
+          if (!root) root = new SubagentSettingsUI(tui, theme, kb, done, ctx);
+          else root.resume(done);
+          const screen = root;
+          return {
+            capturesViewportInput: true,
+            render: (width: number) => screen.render(width),
+            handleInput: (data: string) => screen.handleInput(data),
+            invalidate: () => screen.invalidate(),
+          };
+        },
       );
       if (!action) return;
-      tab = action.tab;
-      selectedName = action.agentName;
+      const { tab, agentName } = action;
       const scope = (["session", "project", "global"] as const)[tab];
       try {
-        const model = await SubagentSettingsUI.selectModel(ctx, selectedName, tab);
+        const model = await SubagentSettingsUI.selectModel(ctx, agentName, tab);
         if (model !== null) {
-          setModelConfig(scope, selectedName, model, ctx);
-          ctx.ui.notify(`Saved ${scope} model for ${selectedName}`, "info");
+          setModelConfig(scope, agentName, model.value, ctx);
+          ctx.ui.notify(model.value === null ? `Removed ${scope} override for ${agentName}` : `Saved ${scope} model for ${agentName}`, "info");
         }
       } catch (error) {
         ctx.ui.notify(`Cannot update subagent model: ${error instanceof Error ? error.message : String(error)}`, "error");
