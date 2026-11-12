@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { checkCommits } from '../scripts/check-commits.mjs';
 
-function fixture({ base = 'new-base', subjects = ['feat: add feature', 'chore(main): release 3.7.2'], related = true } = {}) {
+function fixture({ base = 'new-base', subjects = ['feat: add feature', 'chore(main): release 1.0.0'], related = true } = {}) {
   const calls = [];
   const git = (...args) => {
     calls.push(args);
@@ -24,7 +24,7 @@ function fixture({ base = 'new-base', subjects = ['feat: add feature', 'chore(ma
 
 test('commit policy checks the supplied new range and conventional bot title', () => {
   const { check, calls } = fixture();
-  assert.equal(check({ title: 'chore(main): release 3.7.2' }), 2);
+  assert.equal(check({ title: 'chore(main): release 1.0.0' }), 2);
   assert.ok(calls.some(([cmd, range]) => cmd === 'rev-list' && range === 'new-base..head'));
 });
 for (const base of [undefined, '', '0000000000000000000000000000000000000000', 'old-base']) {

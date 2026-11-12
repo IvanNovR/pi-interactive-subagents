@@ -16,7 +16,7 @@ test('first release uses initial-version, not a fabricated previous-release mani
   const manifest = JSON.parse(read('.release-please-manifest.json'));
   const pkg = JSON.parse(read('package.json'));
   assert.equal(config['release-type'], 'node');
-  assert.equal(config.packages['.']['initial-version'], '3.7.2');
+  assert.equal(config.packages['.']['initial-version'], '1.0.0');
   assert.equal(config['release-as'], undefined);
   assert.equal(config.packages['.']['release-as'], undefined);
   assert.equal(config['bootstrap-sha'], legacyBoundary);
@@ -24,7 +24,7 @@ test('first release uses initial-version, not a fabricated previous-release mani
   assert.equal(config['include-v-in-tag'], true);
   if (!Object.hasOwn(manifest, '.')) {
     assert.deepEqual(manifest, {});
-    assert.equal(pkg.version, '3.7.2');
+    assert.equal(pkg.version, '1.0.0');
   } else {
     // The first actual release PR is supposed to populate this field.
     assert.equal(manifest['.'], pkg.version);

@@ -280,7 +280,7 @@ npm run check:commits
 
 The default tests and installed-tarball checks do not call model providers or launch Pi/tmux sessions. `npm run test:integration` is a separate, manually opted-in real-session suite; it is not run by CI or release publication checks.
 
-New commits and PR titles use Conventional Commits. Imported history through `c3e8b53` is an explicit legacy boundary, not rewritten or treated as compliant. See [the maintainer release guide](docs/RELEASING.md) for the exact **3.7.2** bootstrap, disabled-by-default automation, trusted publishing, and recovery.
+New commits and PR titles use Conventional Commits. Imported history through `c3e8b53` is an explicit legacy boundary, not rewritten or treated as compliant. See [the maintainer release guide](docs/RELEASING.md) for the exact **1.0.0** bootstrap, disabled-by-default automation, trusted publishing, and recovery.
 
 ## Requirements
 
