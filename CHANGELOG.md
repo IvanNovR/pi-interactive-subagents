@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/IvanNovR/pi-interactive-subagents/compare/v1.0.0...v1.0.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **release:** document approval-required PR checks ([a5283d3](https://github.com/IvanNovR/pi-interactive-subagents/commit/a5283d353498708eeb8fc689b0ed9cf7125bd512))
+
 ## 1.0.0 (2026-11-12)
 
 
