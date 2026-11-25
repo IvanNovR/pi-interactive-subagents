@@ -1,6 +1,6 @@
 {
   "name": "@ivannovr/pi-interactive-subagents",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
   "keywords": [
     "pi-package"
