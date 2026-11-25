@@ -15,8 +15,9 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { isStopping, runtimeFile, writeRuntime } from "./runtime.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -183,10 +184,49 @@ export default function (pi: ExtensionAPI) {
   // lands — on `input` (covers a reply steered into the current run) and on
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
+  const runtimeDir = process.env.PI_SUBAGENT_RUNTIME_DIR;
+  const runId = process.env.PI_SUBAGENT_ID;
+  const stopping = () => isStopping(runtimeDir, runId);
+  const activeTools = new Set<string>();
+  let stopTimer: ReturnType<typeof setInterval> | undefined;
+  let idleSince = 0;
+  let compacting = false;
+  let navigating = false;
+  const userBash: { command: string; started: number }[] = [];
+  const completedUserBash = new Set<string>();
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    if (runtimeDir && runId) {
+      if (stopTimer) clearInterval(stopTimer);
+      stopTimer = setInterval(() => {
+        // Escape takes the host's normal cancellation path (retry, compaction,
+        // bash, model, etc.). Never fake it with an LLM message or infer idle
+        // from stale activity. Include active tools for legacy Pi hosts.
+        if (!stopping()) return;
+        if (userBash.length) {
+          // User !bash is not included in ctx.isIdle() on either Pi lineage.
+          // Pair each recorded result once, including concurrent !bash runs.
+          for (const entry of ctx.sessionManager.getEntries() as any[]) {
+            if (entry.type !== "message" || entry.message?.role !== "bashExecution" || completedUserBash.has(entry.id)) continue;
+            const index = userBash.findIndex((pending) => entry.message.command === pending.command &&
+              entry.message.timestamp >= pending.started);
+            if (index >= 0) { userBash.splice(index, 1); completedUserBash.add(entry.id); }
+          }
+        }
+        if (!ctx.isIdle() || ctx.hasPendingMessages?.() || activeTools.size > 0 || compacting || navigating || userBash.length) {
+          idleSince = 0;
+          rmSync(runtimeFile(runtimeDir, runId, "settled"), { force: true });
+          return;
+        }
+        if (!idleSince) idleSince = Date.now();
+        if (Date.now() - idleSince >= 250) {
+          writeRuntime(runtimeDir, runId, "settled", { at: Date.now() });
+        }
+      }, 100);
+      stopTimer.unref();
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -195,6 +235,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", () => {
+    if (stopping()) return { action: "handled" as const };
     recorder.input();
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
@@ -211,7 +252,17 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
+  pi.on("session_before_compact", () => { compacting = true; });
+  pi.on("session_compact", () => { compacting = false; });
+  // New hosts emit failure/cancellation; on legacy hosts a cancelled manual
+  // compaction conservatively falls back instead of claiming it has settled.
+  (pi.on as Function)("session_compact_failed", () => { compacting = false; });
+  pi.on("session_before_tree", () => { navigating = true; });
+  pi.on("session_tree", () => { navigating = false; });
+  pi.on("user_bash", (event) => { userBash.push({ command: event.command, started: Date.now() }); });
+
   pi.on("before_agent_start", () => {
+    idleSince = 0;
     recorder.beforeAgentStart();
   });
 
@@ -224,6 +275,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event, ctx) => {
+    if (stopping()) return; // Stop controller owns exit; never restart/auto-exit.
     const messages = (event as any).messages as any[] | undefined;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
@@ -297,10 +349,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", (event) => {
+    activeTools.add((event as any).toolCallId);
+    idleSince = 0;
     recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
   });
 
   pi.on("tool_call", (event) => {
+    if (stopping()) return { block: true, reason: "Subagent is stopping." };
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
   });
 
@@ -313,10 +368,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", (event) => {
+    activeTools.delete((event as any).toolCallId);
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
   });
 
   pi.on("session_shutdown", (event) => {
+    if (stopTimer) clearInterval(stopTimer);
+    stopTimer = undefined;
     recorder.sessionShutdown((event as any).reason);
   });
 

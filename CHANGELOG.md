@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+<!-- Pending review notes: remove this section in the release PR once its generated entry covers these changes. -->
+- Cancel a descendant subtree with `subagent_stop`, using cooperative Escape cancellation and bounded TERM/KILL fallback with explicit cleanup failures.
+- Inspect the active descendant tree in centered `/subagents` dialogs; confirm a selected subtree stop separately, or cancel with Escape.
+- Resume stopped Pi agents by name with preserved history and sandbox settings.
+- Reject duplicate explicit names to prevent ambiguous targeting and lost resume handles; omitted names still auto-suffix.
+
 ## [1.0.1](https://github.com/IvanNovR/pi-interactive-subagents/compare/v1.0.0...v1.0.1) (2026-11-12)
 
 

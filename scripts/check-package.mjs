@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
@@ -49,6 +49,7 @@ try {
   ];
   assert.deepEqual(pack.files.map(({ path }) => path).sort(), required.sort(), 'Tarball must contain all and only curated runtime/documentation files');
   for (const { path } of pack.files) {
+    assert.ok(!['SUBAGENT_STOP.md', 'SUBAGENT_SETTINGS_IMPLEMENTATION.md', 'SUBAGENT_SETTINGS_TUI_IMPLEMENTATION.md'].includes(basename(path)), `Local implementation notes must not ship: ${path}`);
     assert.match(path, /^(?:package\.json|README\.md|LICENSE|CHANGELOG\.md|config\.json\.example|docs\/RELEASING\.md|agents\/[^/]+\.md|pi-extension\/subagents\/(?:[^/]+\.ts|tools\/[^/]+\.ts|plugin\/(?:\.claude-plugin\/plugin\.json|hooks\/(?:hooks\.json|on-stop\.sh))))$/, `Unexpected runtime/documentation file: ${path}`);
   }
   for (const name of ['scout', 'researcher', 'worker']) assert.ok(required.includes(`agents/${name}.md`));
@@ -91,8 +92,8 @@ try {
       registerMessageRenderer() {}, registerShortcut() {}, getAllTools: () => [],
     };
     module.default(api);
-    assert.deepEqual([...tools.keys()].sort(), ['subagent', 'subagent_message', 'subagents_list']);
-    assert.deepEqual([...commands.keys()].sort(), ['subagent', 'subagent-settings']);
+    assert.deepEqual([...tools.keys()].sort(), ['subagent', 'subagent_message', 'subagent_stop', 'subagents_list']);
+    assert.deepEqual([...commands.keys()].sort(), ['subagent', 'subagent-settings', 'subagents']);
     assert.ok(handlers.has('session_start') && handlers.has('session_shutdown'));
     const agents = module.__test__.discoverAgentDefinitions(fixture);
     assert.deepEqual(agents.map(({ name }) => name).sort(), ['researcher', 'scout', 'worker']);
