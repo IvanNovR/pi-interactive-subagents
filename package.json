@@ -25,7 +25,7 @@
   ],
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/system-prompt-mode.test.ts test/*.test.mjs",
+    "test": "node --test test/test.ts test/stop.test.ts test/system-prompt-mode.test.ts test/*.test.mjs",
     "check:package": "node scripts/check-package.mjs",
     "check:commits": "node scripts/check-commits.mjs",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"

@@ -96,7 +96,7 @@ function rebalanceSurfaces(hintPane?: string): void {
     try {
       // -t <pane> resolves to that pane's window; does not change focus.
       execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
+        encoding: "utf8", timeout: 2000,
       });
     } catch {
       // Pane/window may be gone; balancing is best-effort.
@@ -144,7 +144,7 @@ export function createSurfaceSplit(
   }
   args.push("-P", "-F", "#{pane_id}");
 
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
+  const pane = execFileSync("tmux", args, { encoding: "utf8", timeout: 2000 }).trim();
   if (!pane.startsWith("%")) {
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
   }
@@ -224,7 +224,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   const { stdout } = await execFileAsync(
     "tmux",
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    { encoding: "utf8" },
+    { encoding: "utf8", timeout: 2000 },
   );
   return stdout;
 }
@@ -234,8 +234,31 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8", timeout: 2000 });
   rebalanceSurfaces();
+}
+
+/** A real key event, never literal text or an LLM instruction. */
+export function sendEscape(surface: string): void {
+  execFileSync("tmux", ["send-keys", "-t", surface, "Escape"], { timeout: 2000 });
+}
+
+/** undefined means the pane is gone; other tmux failures are not hidden. */
+export function surfacePid(surface: string): number | undefined {
+  try {
+    const value = execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_pid}"], {
+      encoding: "utf8", timeout: 2000,
+    }).trim();
+    // tmux display-message can succeed with empty output for a vanished pane.
+    if (!value) return undefined;
+    const pid = Number(value);
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid tmux pane PID");
+    return pid;
+  } catch (error: any) {
+    // Permission/protocol/timeout failures are not proof that a pane is gone.
+    if (/can't find pane|no server running|no sessions|(?:failed to connect|error connecting).*?(?:No such file or directory|Connection refused)/i.test(String(error.stderr))) return undefined;
+    throw error;
+  }
 }
 
 // ── Exit polling ──
@@ -284,13 +307,27 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** A stop owns cleanup; don't mistake its pane closure for normal success. */
+    stopResult?: () => PollResult | "pending" | undefined;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let stopPendingSince = 0;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
+    }
+
+    const stopping = options.stopResult?.();
+    if (stopping && stopping !== "pending") return stopping;
+    if (stopping === "pending") {
+      if (!stopPendingSince) stopPendingSince = Date.now();
+      if (Date.now() - stopPendingSince > 30000) {
+        throw new Error("Stop controller did not finish within 30 seconds; pane/process cleanup is unconfirmed.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, options.interval));
+      continue;
     }
 
     // Fast path: check for .exit sidecar file (written by the error path)
@@ -299,8 +336,10 @@ export async function pollForExit(
         const exitFile = `${options.sessionFile}.exit`;
         if (existsSync(exitFile)) {
           const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+          const stop = options.stopResult?.();
+          if (stop === "pending") continue;
           rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
+          return stop ?? interpretExitSidecar(data);
         }
       } catch {}
     }
@@ -309,7 +348,9 @@ export async function pollForExit(
     if (options.sentinelFile) {
       try {
         if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
+          const stop = options.stopResult?.();
+          if (stop === "pending") continue;
+          return stop ?? { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
     }
@@ -319,17 +360,28 @@ export async function pollForExit(
       const screen = await readScreenAsync(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+        const stop = options.stopResult?.();
+        if (stop === "pending") continue;
+        return stop ?? { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      // Missing panes must terminate their watchers, not poll forever.
+      if (surfacePid(surface) === undefined) {
+        // A stop marker can arrive while capture-pane is in flight.
+        const stop = options.stopResult?.();
+        if (stop === "pending") continue;
+        return stop ?? { reason: "error", exitCode: 1, errorMessage: "Subagent pane disappeared before completion." };
+      }
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
         try {
           const exitFile = `${options.sessionFile}.exit`;
           if (existsSync(exitFile)) {
             const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+            const stop = options.stopResult?.();
+            if (stop === "pending") continue;
             rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
+            return stop ?? interpretExitSidecar(data);
           }
         } catch {}
       }
